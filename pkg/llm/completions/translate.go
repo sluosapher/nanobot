@@ -145,6 +145,12 @@ func toRequest(req *types.CompletionRequest) (Request, error) {
 			Role: msg.Role,
 		}
 
+		// Image data URLs returned by tool calls in this message. The OpenAI
+		// chat/completions schema only allows image_url parts inside user
+		// messages, so we collect them here and emit a follow-up user message
+		// after the tool message below.
+		var toolResultImageURLs []string
+
 		// Handle single text content case
 		if len(msg.Items) == 1 && msg.Items[0].Content != nil && msg.Items[0].Content.Type == "text" && msg.Items[0].Content.Text != "" {
 			openAIMsg.Content.Text = &msg.Items[0].Content.Text
@@ -220,7 +226,10 @@ func toRequest(req *types.CompletionRequest) (Request, error) {
 					openAIMsg.Role = "tool"
 					openAIMsg.ToolCallID = item.ToolCallResult.CallID
 
-					// Combine all content into text
+					// Combine all content into text. Image content is captured
+					// separately and emitted as a follow-up user message below,
+					// since chat/completions disallows image_url inside tool
+					// messages.
 					var resultText string
 					for _, content := range item.ToolCallResult.Output.Content {
 						if content.Type == "text" {
@@ -228,6 +237,12 @@ func toRequest(req *types.CompletionRequest) (Request, error) {
 								resultText += "\n"
 							}
 							resultText += content.Text
+						} else if content.Type == "image" && content.Data != "" && content.MIMEType != "" {
+							toolResultImageURLs = append(toolResultImageURLs, content.ToImageURL())
+							if resultText != "" {
+								resultText += "\n"
+							}
+							resultText += "[Image attached; see following message]"
 						} else if content.Type == "resource" && content.Resource != nil && content.Resource.Annotations != nil && slices.Contains(content.Resource.Annotations.Audience, "assistant") {
 							if _, ok := types.TextMimeTypes[content.Resource.MIMEType]; ok {
 								text := content.Resource.Text
@@ -240,12 +255,18 @@ func toRequest(req *types.CompletionRequest) (Request, error) {
 								}
 								resultText += text
 							} else if _, ok := types.ImageMimeTypes[content.Resource.MIMEType]; ok {
-								// For tool results, we can't include images directly in OpenAI completions API
-								// So we'll just add a reference
+								if content.Resource.Blob != "" {
+									url := fmt.Sprintf("data:%s;base64,%s", content.Resource.MIMEType, content.Resource.Blob)
+									toolResultImageURLs = append(toolResultImageURLs, url)
+								}
 								if resultText != "" {
 									resultText += "\n"
 								}
-								resultText += fmt.Sprintf("[Image: %s]", content.Resource.URI)
+								if content.Resource.URI != "" {
+									resultText += fmt.Sprintf("[Image: %s]", content.Resource.URI)
+								} else {
+									resultText += "[Image attached; see following message]"
+								}
 							} else if _, ok := types.PDFMimeTypes[content.Resource.MIMEType]; ok {
 								if resultText != "" {
 									resultText += "\n"
@@ -273,6 +294,31 @@ func toRequest(req *types.CompletionRequest) (Request, error) {
 		}
 
 		result.Messages = append(result.Messages, openAIMsg)
+
+		// If the tool result contained images, emit a follow-up user message
+		// carrying them as image_url parts. Without this, vision-capable
+		// chat/completions backends never receive the image bytes from a
+		// tool call.
+		if len(toolResultImageURLs) > 0 {
+			followupParts := []ContentPart{
+				{Type: "text", Text: "Images returned by the previous tool call:"},
+			}
+			for _, url := range toolResultImageURLs {
+				followupParts = append(followupParts, ContentPart{
+					Type: "image_url",
+					ImageURL: &ImageURL{
+						URL:    url,
+						Detail: "auto",
+					},
+				})
+			}
+			result.Messages = append(result.Messages, Message{
+				Role: "user",
+				Content: MessageContent{
+					ContentParts: followupParts,
+				},
+			})
+		}
 	}
 
 	// Add system message if present
