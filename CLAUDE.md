@@ -9,18 +9,22 @@ Nanobot is a standalone MCP (Model Context Protocol) host that enables building 
 **Technology Stack:**
 - Backend: Go 1.26.0 with GORM (SQLite, MySQL, PostgreSQL), goja (JavaScript runtime for hooks)
 - Frontend: Svelte 5, SvelteKit (static adapter), TypeScript, TailwindCSS 4, DaisyUI
-- Package Manager: pnpm (for frontend dependencies)
+- Package Manager: pnpm workspaces (`packages/*`); root tooling uses Biome, the UI package uses ESLint+Prettier
 
 ## Build and Development Commands
 
 ### Backend (Go)
 
 ```bash
-# Build the nanobot binary (automatically builds UI via go generate)
+# Build the nanobot binary (runs `go generate` first, which builds the UI and embeds it)
 make
 
-# Run nanobot with a configuration file
+# On Windows, the equivalent end-to-end build flow:
+.\build_windows.ps1
+
+# Run nanobot. Default config path is `.nanobot/` (directory) but a single `nanobot.yaml` works too.
 ./bin/nanobot run ./nanobot.yaml
+./bin/nanobot run ./examples/blackjack.yaml
 
 # Run Go tests
 go test ./...
@@ -34,40 +38,42 @@ go generate ./...
 
 # Format Go code
 gofmt -w .
+
+# Full pre-PR validation: gofmt, go vet, go test, go mod tidy check, UI install + ci.
+# Use this before sending changes for review.
+make validate
 ```
+
+**CLI subcommands** (see `pkg/cli/`): `run` (start the host), `call` (invoke a tool/agent against a config), `targets` (list agents/tools), `sessions` (manage persisted sessions). Pass `--debug` / `--trace` for verbose logging; `-C <dir>` to chdir before running.
 
 ### Frontend (UI)
 
-The UI is a SvelteKit application located in the `./ui` directory. This project uses **pnpm** as the package manager.
+The UI is a SvelteKit application located in `./packages/ui/` (a pnpm workspace package — note: the README still says `./ui`, but that path no longer exists). The repo also has a `pnpm dev` shortcut at the root that cd's into it.
 
 ```bash
-cd ui
+# From repo root:
+pnpm install                # install all workspace deps
+pnpm run dev                # shortcut → cd packages/ui && pnpm run dev
+pnpm -r run check           # type-check all workspace packages
+pnpm -r run ci              # what `make validate` runs for the UI (check + build)
 
-# Install dependencies (if needed)
-pnpm install
-
-# Start development server (runs on port 5173)
-pnpm run dev
-
-# Build for production
-pnpm run build
-
-# Lint and format
-pnpm run lint
-pnpm run format
-
-# Type checking
-pnpm run check
+# Or directly inside the UI package:
+cd packages/ui
+pnpm run dev                # vite dev on port 5173
+pnpm run build              # production build into packages/ui/dist (embedded by go generate)
+pnpm run lint               # prettier --check + eslint
+pnpm run format             # prettier --write
+pnpm run check              # svelte-kit sync + svelte-check (type checking)
 ```
 
 ### Development Workflow for UI
 
 When working on the UI, Nanobot automatically forwards requests to the development server:
 
-1. Remove old build: `rm -rf ./ui/dist`
+1. Remove old build: `rm -rf ./packages/ui/dist`
 2. Rebuild backend: `make`
-3. Start UI dev server: `cd ui && pnpm run dev`
-4. The UI runs on port 5173, while Nanobot backend runs on port 8080 and proxies UI requests
+3. Start UI dev server: `pnpm run dev` (or `cd packages/ui && pnpm run dev`)
+4. The UI runs on port 5173, while Nanobot backend runs on port 8080 and proxies UI requests when no embedded `dist` is found
 
 ## Architecture Overview
 
@@ -93,19 +99,18 @@ When working on the UI, Nanobot automatically forwards requests to the developme
 - **Server Layer (`pkg/server/`)** - HTTP server handling MCP protocol over HTTP. Routes requests for initialize, tools/list, tools/call, prompts/*, resources/*, etc. Manages session creation and request routing.
 
 - **Built-in MCP Servers (`pkg/servers/`)** - Nanobot includes several built-in MCP servers:
-  - `agent/` - Exposes individual agents as MCP servers with chat capabilities
-  - `capabilities/` - Session initialization and capability management (workspace setup)
-  - `meta/` - Metadata and introspection tools (list_chats, update_chat, list_agents)
-  - `resources/` - Database-backed resource management (create_resource, delete_resource) with automatic mimetype detection
-  - `workspace/` - Workspace and session management (create/update/delete workspaces, session reading)
+  - `agent/` - Exposes individual agents as MCP servers with chat capabilities (chat_call, chat_call_ui, elicitation)
+  - `meta/` - Metadata, introspection, and resource tools
+  - `system/` - System-level tools: config, files, mcp_servers, question, read, todo, skills (each with its own `*_test.go`)
+  - `workflows/` - Workflow execution server and per-tool dispatch (`server.go`, `tools_server.go`)
 
 - **Configuration (`pkg/config/`)** - YAML-based configuration loading and validation. Supports profiles, extends (inheritance), and environment variables. See `pkg/config/schema.yaml` for the complete schema.
 
 **Key Architectural Patterns:**
 
-- **Tool Mappings** - Tools from MCP servers are mapped to agent-accessible tools. The `BuildToolMappings` method creates this mapping by resolving tool references from agents and MCP servers.
+- **Tool Mappings** - Tools from MCP servers are mapped to agent-accessible tools. `BuildToolMappings` (interface in `pkg/sessiondata/sessiondata.go`, used by `pkg/agents/run.go`) resolves tool references from `agent.Tools`, `agent.Agents`, and `agent.MCPServers`.
 
-- **Hooks** - Lifecycle hooks for agents and MCP servers (config, request, response). Hooks are TypeScript/JavaScript functions that can modify configuration and messages. See `hooks.ts` for type definitions.
+- **Hooks** - Lifecycle hooks for agents and MCP servers (config, request, response). Hooks are TypeScript/JavaScript functions executed via goja that can modify configuration and messages. Go-side types live in `pkg/types/hooks.go`; execution is in `pkg/mcp/hooks.go`. (There is no longer a root-level `hooks.ts`.)
 
 - **Sandboxing** - MCP servers can run in Docker containers for isolation. The `pkg/mcp/sandbox/` handles containerization and port mapping.
 
@@ -113,12 +118,14 @@ When working on the UI, Nanobot automatically forwards requests to the developme
 
 **Tech Stack:** Svelte 5 (runes-based reactivity), SvelteKit with static adapter, TypeScript, TailwindCSS 4, DaisyUI, Lucide Icons (@lucide/svelte)
 
-**Key Files:**
+**Key Files (all under `packages/ui/`):**
 
 - `src/lib/chat.svelte.ts` - Core chat API and state management using Svelte 5 runes
+- `src/lib/workspace.svelte.ts` - Workspace state
 - `src/lib/types.ts` - TypeScript type definitions for chat, agents, messages, tools
+- `src/lib/mcpclient.ts` - Browser-side MCP client (uses `@modelcontextprotocol/sdk`)
 - `src/lib/components/` - Reusable Svelte components
-- `hooks.ts` (root) - TypeScript definitions for agent hooks (synced with Go types in `pkg/types/hooks.go`)
+- `build.go` / `fs.go` - Embeds `dist/` into the Go binary (driven by `//go:generate` in root `generate.go`)
 
 **UI Components:**
 
@@ -188,10 +195,9 @@ Go tests follow standard Go conventions:
 
 ### Adding a New Agent Hook
 
-1. Define TypeScript types in `hooks.ts` (root level)
-2. Update corresponding Go types in `pkg/types/hooks.go`
-3. Implement hook handling in `pkg/agents/` or relevant package
-4. Hook execution is managed through `pkg/mcp/hooks.go`
+1. Update Go types in `pkg/types/hooks.go`
+2. Implement hook handling in `pkg/agents/` or relevant package
+3. Hook execution is managed through `pkg/mcp/hooks.go` (goja-backed JS runtime)
 
 ### Adding a New Tool
 
@@ -219,7 +225,14 @@ When implementing MCP features, refer to:
 
 ## Code Style
 
-- Go: Follow standard Go conventions, use `gofmt`
-- TypeScript/Svelte: Uses Prettier and ESLint (configs in `ui/`)
-- Use Svelte 5 runes (`$state`, `$derived`, `$effect`) rather than legacy store patterns
-- Icons: Always use Lucide icons from `@lucide/svelte` (e.g., `import { IconName } from '@lucide/svelte'`)
+- Go: Follow standard Go conventions, use `gofmt`. `make validate` enforces gofmt + `go vet` + `go test` + `go mod tidy` cleanliness.
+- TypeScript/Svelte (in `packages/ui/`): Prettier + ESLint (configs in `packages/ui/`), tabs for indent.
+- Root-level TS/JS (workspace tooling, hooks, etc.): Biome (`biome.json`) — tab indent, double quotes, organized imports.
+- Use Svelte 5 runes (`$state`, `$derived`, `$effect`) rather than legacy store patterns.
+- Icons: Always use Lucide icons from `@lucide/svelte` (e.g., `import { IconName } from '@lucide/svelte'`).
+
+## Repository Conventions (from AGENTS.md)
+
+- Place new backend packages under `pkg/<domain>`; UI-only assets live next to the relevant feature in `packages/ui/src/`.
+- Recent commit style is short imperative subjects, optionally prefixed with a category, e.g. `Fix SSE shutdown logging in MCP HTTP client`, `Chore: Convert to slog`.
+- Prefer running the smallest relevant test first, then `make validate` before finishing. If you change generation or packaging behavior, verify with the real build (`make`), not just unit tests.

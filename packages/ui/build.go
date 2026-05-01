@@ -6,12 +6,31 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 )
 
-func run(name string, args ...string) {
+func buildCommand(name string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, args...)
+	cmd.Env = withCIEnv(os.Environ())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	return cmd
+}
+
+func withCIEnv(env []string) []string {
+	for i, entry := range env {
+		if strings.HasPrefix(entry, "CI=") {
+			updated := append([]string{}, env...)
+			updated[i] = "CI=true"
+			return updated
+		}
+	}
+
+	return append(append([]string{}, env...), "CI=true")
+}
+
+func run(name string, args ...string) {
+	cmd := buildCommand(name, args...)
 	if err := cmd.Run(); err != nil {
 		log.Fatal(err)
 	}
